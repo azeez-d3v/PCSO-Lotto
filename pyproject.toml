@@ -7,9 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "curl-cffi>=0.13.0",
     "fastapi>=0.116.1",
-    "hypercorn>=0.17.3",
     "python-dotenv>=1.1.1",
     "pytz>=2025.2",
     "selectolax>=0.3.34",
     "upstash-redis>=1.4.0",
+    "uvicorn>=0.35.0",
 ]

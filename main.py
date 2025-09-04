@@ -1,10 +1,29 @@
+"""PCSO Lotto Results API (FastAPI)
+
+Public JSON API that scrapes official draw results from https://www.pcso.gov.ph
+and returns normalized structured data with pagination.
+
+Key features:
+    * Date range query (defaults constrained to site supported range).
+    * Lightweight caching layer (Redis via Upstash if configured; in-memory fallback).
+    * Fast scraping using curl_cffi (HTTP/2, Chrome impersonation) + selectolax parser.
+
+Environment variables (optional):
+    UPSTASH_REDIS_REST_URL      Redis REST endpoint (for caching)
+    UPSTASH_REDIS_REST_TOKEN    Redis auth token
+
+If Redis credentials are absent or initialization fails, a simple in-process
+TTL cache is used instead (NOT multi-process safe; fine for local/dev or single
+container deployments).
+"""
+
 import asyncio
 import calendar
 import json
 import time
 from math import ceil
 from datetime import date, datetime
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 import pytz
 from fastapi import FastAPI, Query, HTTPException
@@ -36,8 +55,51 @@ MAX_END_DATE = datetime.now(pytz.timezone("Asia/Manila")).date()
 # Month lookup optimization
 MONTH_MAP = {m: i for i, m in enumerate(calendar.month_name) if m}
 
-# Redis (Upstash)
-redis = redis = Redis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
+# --------------------
+# Cache (Redis or in-memory fallback)
+# --------------------
+class InMemoryAsyncCache:
+    """Minimal async dict + TTL (subset of Redis get/set used here).
+
+    For dev / single process fallback only.
+    """
+
+    def __init__(self):
+        self._store: dict[str, tuple[Optional[float], Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, key: str):  # type: ignore[override]
+        now = time.time()
+        async with self._lock:
+            item = self._store.get(key)
+            if not item:
+                return None
+            expires_at, value = item
+            if expires_at is not None and expires_at < now:
+                # Expired - remove and miss
+                self._store.pop(key, None)
+                return None
+            return value
+
+    async def set(self, key: str, value: Any, ex: Optional[int] = None, **_):  # type: ignore[override]
+        expires_at = (time.time() + ex) if ex else None
+        async with self._lock:
+            self._store[key] = (expires_at, value)
+        return True
+
+
+REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
+if REDIS_URL and REDIS_TOKEN:
+    try:
+        redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+    except Exception:
+        # Fallback if instantiation fails
+        redis = InMemoryAsyncCache()
+else:
+    # No credentials provided -> in-memory fallback
+    redis = InMemoryAsyncCache()
 
 # Caching TTLs
 EVENT_TTL = 30         # seconds for hidden ASP.NET fields
@@ -46,7 +108,7 @@ RESULT_TTL = 60        # seconds for full query results
 # Limit concurrent outbound requests to PCSO
 OUTBOUND_SEMAPHORE = asyncio.Semaphore(8)
 
-app = FastAPI(title="PCSO Lotto Results API (Async + Redis)", version="2.0.0")
+app = FastAPI(title="PCSO Lotto Results Unofficial API", version="2.0.0")
 
 
 # --------------------
@@ -82,8 +144,8 @@ class ErrorResponse(BaseModel):
 # Helpers
 # --------------------
 def format_human_date(d: date) -> str:
-    return f"{d.strftime('%B')} {d.day}, {d.year}"
-
+    """Return human readable date form: 'Month D, YYYY'."""
+    return f"{d.strftime('%B')} {d.day}, {d.year}" 
 
 def validate_and_resolve_dates(
     start_month: Optional[str],
@@ -93,6 +155,10 @@ def validate_and_resolve_dates(
     end_day: Optional[int],
     end_year: Optional[int],
 ) -> Tuple[date, date, str, int, int, str, int, int]:
+    """Normalize & validate date inputs, applying defaults & constraints.
+
+    Returns tuple: (start_dt, end_dt, start_month, start_day, start_year, end_month, end_day, end_year)
+    """
     # Apply defaults
     if start_month is None or start_day is None or start_year is None:
         start_month = MIN_START_DATE.strftime("%B")
@@ -136,11 +202,12 @@ def validate_and_resolve_dates(
 
 
 def make_result_cache_key(start_dt: date, end_dt: date) -> str:
-    # Game is fixed to "0" (All) in this version; include if you later expose it
+    """Cache key for results (game fixed to '0'=All for now)."""
     return f"pcso:results:{start_dt.isoformat()}:{end_dt.isoformat()}:game0"
 
 
 def event_cache_key() -> str:
+    """Cache key for hidden ASP.NET form fields (VIEWSTATE etc.)."""
     return "pcso:event_fields"
 
 
@@ -148,7 +215,12 @@ def event_cache_key() -> str:
 # Scraper (async)
 # --------------------
 async def get_event_fields_async(session: requests.AsyncSession) -> Dict[str, str]:
-    # Try Redis cache first
+    """Fetch & cache hidden form fields needed for POST searches.
+
+    Fields change periodically; short TTL (EVENT_TTL) keeps them fresh while
+    avoiding an extra GET for each query.
+    """
+    # Cache first
     cache = await redis.get(event_cache_key())
     if cache:
         try:
@@ -181,6 +253,12 @@ async def scrape_lotto_results_async(
     start_month: str, start_day: int, start_year: int,
     end_month: str, end_day: int, end_year: int,
 ) -> Tuple[list[LottoResult], int]:
+    """Scrape results for inclusive date range, returning (rows, total_rows).
+
+    Uses cache; on miss performs GET (fields) + POST (results). Parses HTML
+    table into structured list. Unexpected structure raises ValueError to signal
+    upstream error handling.
+    """
     # Check result cache
     start_dt = date(start_year, MONTH_MAP[start_month], start_day)
     end_dt = date(end_year, MONTH_MAP[end_month], end_day)
@@ -198,7 +276,7 @@ async def scrape_lotto_results_async(
         except Exception:
             pass  # ignore cache error and proceed to scrape
 
-    async with requests.AsyncSession() as s:
+    async with requests.AsyncSession(impersonate="chrome136", verify=False, http_version="v2") as s:
         event_fields = await get_event_fields_async(s)
 
         form = {
@@ -245,7 +323,7 @@ async def scrape_lotto_results_async(
                 winners=cols[4],
             ))
 
-    # Cache parsed results (compact JSON)
+    # Cache parsed results
     try:
         to_store = {
             "rows": [r.model_dump() for r in results],
@@ -261,21 +339,31 @@ async def scrape_lotto_results_async(
 # --------------------
 # API Endpoint (async)
 # --------------------
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the PCSO Lotto Results API"}
+
 @app.get(
     "/lotto-results",
     response_model=SuccessResponse,
     responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
 async def get_lotto_results(
-    start_month: Optional[str] = Query(None, example="September"),
-    start_day: Optional[int] = Query(None, ge=1, le=31, example=2),
-    start_year: Optional[int] = Query(None, ge=1900, le=2100, example=2025),
-    end_month: Optional[str] = Query(None, example="September"),
-    end_day: Optional[int] = Query(None, ge=1, le=31, example=4),
-    end_year: Optional[int] = Query(None, ge=1900, le=2100, example=2025),
-    page: int = Query(1, ge=1, example=1),
-    per_page: int = Query(50, ge=1, le=50, example=50),
+    start_month: Optional[str] = Query(None, examples="September"),
+    start_day: Optional[int] = Query(None, ge=1, le=31, examples=2),
+    start_year: Optional[int] = Query(None, ge=1900, le=2100, examples=2025),
+    end_month: Optional[str] = Query(None, examples="September"),
+    end_day: Optional[int] = Query(None, ge=1, le=31, examples=4),
+    end_year: Optional[int] = Query(None, ge=1900, le=2100, examples=2025),
+    page: int = Query(1, ge=1, examples=1),
+    per_page: int = Query(50, ge=1, le=50, examples=50),
 ):
+    """HTTP endpoint: retrieve paginated lotto results for a date range.
+
+    Query params are optional; sensible defaults cover full available window.
+    Pagination enforced (max 50 / page) to keep responses lean.
+    404 if no rows found; 400 for bad input; 502 for upstream network errors.
+    """
     # Validate and resolve dates with defaults
     (
         start_dt, end_dt,

@@ -1,11 +1,12 @@
-# PCSO Lotto Results API (Async + Redis)
+# PCSO Lotto Results Unofficial API
 
-FastAPI service that scrapes official Philippine Charity Sweepstakes Office (PCSO) lotto draw results on‑demand, adds Redis (Upstash) caching, pagination, and robust date validation.
+FastAPI service that scrapes official Philippine Charity Sweepstakes Office (PCSO) lotto draw results on‑demand, adds Redis (Upstash) caching (with automatic in‑memory fallback), pagination, and robust date validation.
 
 ## Features
 
 * Async scraping with `curl_cffi` + `selectolax` (fast HTML parsing)
 * Smart caching in Upstash Redis (hidden ASP.NET event fields + query results)
+* Automatic in-memory TTL cache if Redis credentials are not provided
 * Date range normalization with safe defaults (2015-01-01 → today Asia/Manila)
 * Pagination (page/per_page) with bounded page size (max 50)
 * Lightweight rate limiting via outbound semaphore (limits concurrent upstream requests)
@@ -13,7 +14,7 @@ FastAPI service that scrapes official Philippine Charity Sweepstakes Office (PCS
 
 ## Tech Stack
 
-FastAPI, asyncio, curl_cffi, selectolax, Upstash Redis (`upstash-redis` / `upstash_redis`), Pydantic, uv / pip.
+FastAPI, asyncio, curl_cffi, selectolax, Upstash Redis (`upstash-redis` / `upstash_redis`), Pydantic, uv / pip. Falls back to a lightweight in-process TTL cache for development.
 
 ## Environment Variables (.env)
 
@@ -24,7 +25,7 @@ UPSTASH_REDIS_REST_URL=https://<your-upstash-endpoint>
 UPSTASH_REDIS_REST_TOKEN=<your-upstash-rest-token>
 ```
 
-The code calls `Redis.from_env()` so defaults follow the official Upstash variable names.
+If these are omitted the API still works using an in-memory cache (good for local dev / single process). For production or multi-instance scaling, configure Redis.
 
 ## Install & Run (Local)
 
@@ -45,6 +46,14 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Open: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+## Quick Example
+
+Request (default full range):
+
+```bash
+curl -s 'http://127.0.0.1:8000/lotto-results?per_page=5'
+```
 
 ## Endpoint
 
@@ -108,18 +117,48 @@ If the range yields no rows a 404 is returned. Page overflow returns 400.
 | Hidden event fields | pcso:event_fields | 30 | Required ASP.NET viewstate data |
 | Result set | pcso:results:{start}:{end}:game0 | 60 | Short TTL to keep data fresh |
 
+If Redis is unavailable at startup, an in-memory async cache object is used instead. It supports the subset of `get` / `set(ex=TTL)` used here. Note: not multi-process safe—use real Redis in clustered/containerized production.
+
 ## Rate / Load Safety
 
 Outbound requests to the PCSO site are wrapped by an `asyncio.Semaphore(8)` limiting parallelism to 8 to reduce server stress.
 
-## Deployment (Railway)
+## Production Notes
 
-`railway.json` present. Add environment variables in Railway dashboard and deploy. Default start command can be (adjust as needed):
+* Increase RESULT_TTL if you want fewer scrapes (trade freshness for load).
+* Behind a proxy/load balancer, ensure a single Redis instance is shared.
+* Consider adding external rate limiting (e.g., Cloudflare Rules) if public.
+* Treat scraped data as best-effort; site structure changes can break parsing—watch logs for "Unexpected table structure" errors.
+* Geolocation: The official PCSO site blocks many non‑Philippines IP ranges. Deploy from a Philippine region or route traffic through a PH proxy/VPN. Without this the scraper may return 403/blocked errors.
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port $PORT
-```
+### Geolocation / Access Note
+
+If you deploy on providers whose egress IPs are outside the Philippines, requests can fail (often 403s). To ensure reliability:
+
+1. Prefer a PH-based VPS/region if available.
+2. Or configure a trusted PH HTTPS forward proxy and set an outbound proxy at the HTTP client layer (you can extend the code to pass a proxy to `requests.AsyncSession`).
+3. Avoid unstable public proxies—they introduce latency and failure noise.
+4. Monitor logs for spikes in 403 / unexpected HTML to detect geofence changes.
+
+## Contributing
+
+PRs and issues welcome. Please:
+
+1. Open an issue for non-trivial changes.
+2. Keep functions small & documented.
+3. Run a quick manual request before submitting.
+
+Possible enhancements:
+
+* Add game filter parameter (currently hardcoded to all games)
+* Add optional CSV / NDJSON export
+* Longer-term historical persistence layer
+* Basic metrics endpoint (`/health`, `/metrics`)
+
+## License
+
+MIT — free for personal or commercial use. See `LICENSE.md`.
 
 ## Disclaimer
 
-Not affiliated with PCSO. Data is scraped from the public website;
+Not affiliated with PCSO. Data is scraped from the public website; verify against official sources before using for critical decisions.

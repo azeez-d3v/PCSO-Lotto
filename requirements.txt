@@ -5,4 +5,3 @@ pytz>=2025.2
 selectolax>=0.3.34
 upstash-redis>=1.4.0
 uvicorn>=0.35.0
-hypercorn>=0.17.3
