@@ -13,7 +13,10 @@ from selectolax.parser import HTMLParser
 from curl_cffi import requests
 from upstash_redis.asyncio import Redis
 from dotenv import load_dotenv
+import os
 
+# Load environment variables from .env if present
+load_dotenv()
 # --------------------
 # Constants & config
 # --------------------
@@ -34,8 +37,7 @@ MAX_END_DATE = datetime.now(pytz.timezone("Asia/Manila")).date()
 MONTH_MAP = {m: i for i, m in enumerate(calendar.month_name) if m}
 
 # Redis (Upstash)
-load_dotenv()  # Load environment variables from .env file
-redis = Redis.from_env()
+redis = redis = Redis(url=os.getenv("UPSTASH_REDIS_REST_URL"), token=os.getenv("UPSTASH_REDIS_REST_TOKEN"))
 
 # Caching TTLs
 EVENT_TTL = 30         # seconds for hidden ASP.NET fields
